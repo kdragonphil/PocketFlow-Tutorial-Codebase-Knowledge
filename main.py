@@ -80,7 +80,10 @@ def main():
         "relationships": {},
         "chapter_order": [],
         "chapters": [],
-        "final_output_dir": None
+        "final_output_dir": None,
+        "api_call_analysis": [],
+        "fastapi_endpoint_analysis": [],
+        "api_documentation_md": ""
     }
 
     # Display starting message with repository/directory and language
