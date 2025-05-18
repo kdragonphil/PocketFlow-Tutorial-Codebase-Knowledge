@@ -87,7 +87,7 @@ class IdentifyAbstractions(Node):
         project_name = shared["project_name"]  # Get project name
         language = shared.get("language", "english")  # Get language
         use_cache = shared.get("use_cache", True)  # Get use_cache flag, default to True
-        max_abstraction_num = shared.get("max_abstraction_num", 10)  # Get max_abstraction_num, default to 10
+        max_abstraction_num = shared.get("max_abstraction_num", 30)  # Get max_abstraction_num, default to 30
 
         # Helper to create context from files, respecting limits (basic example)
         def create_llm_context(files_data):
@@ -534,6 +534,401 @@ Now, provide the YAML output:
         shared["chapter_order"] = exec_res  # List of indices
 
 
+class AnalyzeAPICalls(Node):
+    def prep(self, shared):
+        files_data = shared["files"]  # List of (path, content) tuples
+        project_name = shared["project_name"]
+        language = shared.get("language", "english")
+        use_cache = shared.get("use_cache", True)
+
+        # Filter for frontend files (JavaScript, TypeScript)
+        frontend_files = []
+        for path, content in files_data:
+            if path.endswith((".js", ".jsx", ".ts", ".tsx")):
+                frontend_files.append({"path": path, "content": content})
+
+        if not frontend_files:
+            print("No frontend files (JS/TS) found to analyze for API calls.")
+            return None # Skip exec if no relevant files
+
+        return {
+            "frontend_files": frontend_files,
+            "project_name": project_name,
+            "language": language,
+            "use_cache": use_cache,
+        }
+
+    def exec(self, prep_res):
+        if prep_res is None:
+            return [] # Return empty list if prep returned None
+
+        frontend_files = prep_res["frontend_files"]
+        project_name = prep_res["project_name"]
+        language = prep_res["language"]
+        use_cache = prep_res["use_cache"]
+
+        all_api_calls_info = []
+        print(f"Analyzing API calls in {len(frontend_files)} frontend files using LLM...")
+
+        for file_info in frontend_files:
+            file_path = file_info["path"]
+            file_content = file_info["content"]
+
+            # Add language instruction and hints only if not English
+            # While the primary analysis is on code, the output YAML structure might be described or confirmed in the target language.
+            language_instruction = ""
+            yaml_lang_hint = ""
+            if language.lower() != "english":
+                language_instruction = f"IMPORTANT: The response should be YAML. If you add any descriptive text outside the YAML, it should be in **{language.capitalize()}** language.\n\n"
+                yaml_lang_hint = f" (values for description/notes, if any, should be in {language.capitalize()})"
+
+
+            prompt = f"""
+{language_instruction}For the project `{project_name}`, and the file `{file_path}`:
+
+File Content:
+```{'javascript' if file_path.endswith(('.js', '.jsx')) else 'typescript'}
+{file_content}
+```
+
+Analyze the frontend code (JavaScript/TypeScript) above.
+Identify all API calls (e.g., using `fetch`, `axios`, `XMLHttpRequest`, or other HTTP client libraries).
+
+For each API call found, provide the following details:
+1.  `calling_function_name`: The name of the function in which the API call is made. If it's not in a function, use "global scope" or a relevant class/method name.
+2.  `api_endpoint`: The URL or endpoint of the API being called. If it's a variable, provide the variable name.
+3.  `http_method`: The HTTP method used (e.g., GET, POST, PUT, DELETE).
+4.  `request_parameters`: A list of key-value pairs or a description of parameters sent with the request (query parameters, request body, headers if significant). {yaml_lang_hint}
+5.  `response_usage`: A description of how the API response data is used in the code (e.g., "response.data is stored in `userData` state", "items from response are mapped to UI components"). {yaml_lang_hint}
+
+Format the output as a YAML list of dictionaries, with one dictionary per API call found in this file.
+If no API calls are found in this file, output an empty YAML list `[]`.
+
+Example for a single API call:
+```yaml
+- calling_function_name: "fetchUserDetails"
+  api_endpoint: "/api/users/{{userId}}" # or variable name like "API_BASE_URL + '/users/' + userId"
+  http_method: "GET"
+  request_parameters:
+    - name: "userId"
+      source: "path_variable" # e.g., path_variable, query_param, request_body, header
+      description: "User's unique identifier" {yaml_lang_hint}
+  response_usage: "The user's name (response.name) and email (response.email) are displayed in the profile section." {yaml_lang_hint}
+```
+
+Now, provide the YAML output for the file `{file_path}`:
+"""
+            try:
+                response = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0))
+                yaml_str = response.strip()
+                if "```yaml" in yaml_str:
+                    yaml_str = yaml_str.split("```yaml")[1].split("```")[0].strip()
+                elif "```" in yaml_str: # Handle cases where only ``` is present
+                    yaml_str = yaml_str.split("```")[1].strip()
+
+
+                # Ensure it's valid YAML, even if empty
+                if not yaml_str:
+                    api_calls_in_file = []
+                else:
+                    api_calls_in_file = yaml.safe_load(yaml_str)
+
+                if not isinstance(api_calls_in_file, list):
+                    print(f"Warning: LLM output for {file_path} was not a list, but: {type(api_calls_in_file)}. Treating as no API calls found.")
+                    api_calls_in_file = []
+
+
+                if api_calls_in_file: # Only add if there's content
+                    all_api_calls_info.append({
+                        "file_path": file_path,
+                        "api_calls": api_calls_in_file
+                    })
+                    print(f"  - Found {len(api_calls_in_file)} API call(s) in {file_path}")
+
+            except yaml.YAMLError as e:
+                print(f"Error parsing YAML from LLM response for {file_path}: {e}")
+                print(f"LLM Response was:\n{response}")
+            except Exception as e:
+                print(f"Error processing file {file_path} for API calls: {e}")
+                print(f"LLM Response was (if available):\n{response if 'response' in locals() else 'N/A'}")
+
+
+        if not all_api_calls_info:
+            print("No API calls identified in any frontend files.")
+        else:
+            print(f"Identified API calls in {len(all_api_calls_info)} file(s).")
+        return all_api_calls_info
+
+    def post(self, shared, prep_res, exec_res):
+        shared["api_call_analysis"] = exec_res
+
+
+class AnalyzeFastAPIEndpoints(Node):
+    def prep(self, shared):
+        files_data = shared["files"]  # List of (path, content) tuples
+        project_name = shared["project_name"]
+        language = shared.get("language", "english") # For potential descriptions in YAML
+        use_cache = shared.get("use_cache", True)
+
+        # Filter for Python files
+        python_files = []
+        for path, content in files_data:
+            if path.endswith((".py")):
+                python_files.append({"path": path, "content": content})
+
+        if not python_files:
+            print("No Python files found to analyze for FastAPI endpoints.")
+            return None # Skip exec if no relevant files
+
+        return {
+            "python_files": python_files,
+            "project_name": project_name,
+            "language": language,
+            "use_cache": use_cache,
+        }
+
+    def exec(self, prep_res):
+        if prep_res is None:
+            return [] # Return empty list if prep returned None
+
+        python_files = prep_res["python_files"]
+        project_name = prep_res["project_name"]
+        language = prep_res["language"] # For descriptions in YAML
+        use_cache = prep_res["use_cache"]
+
+        all_endpoints_info = []
+        print(f"Analyzing FastAPI endpoints in {len(python_files)} Python files using LLM...")
+
+        for file_info in python_files:
+            file_path = file_info["path"]
+            file_content = file_info["content"]
+
+            language_instruction = ""
+            yaml_desc_hint = ""
+            if language.lower() != "english":
+                language_instruction = f"IMPORTANT: The response MUST be YAML. If you include any descriptive text for fields like 'description', it should be in **{language.capitalize()}** language.\n\n"
+                yaml_desc_hint = f" (in {language.capitalize()})"
+
+            prompt = f"""
+{language_instruction}For the project `{project_name}`, and the Python file `{file_path}`:
+
+File Content:
+```python
+{file_content}
+```
+
+Analyze the Python code above to identify FastAPI endpoints.
+For each FastAPI endpoint (e.g., defined with `@app.get`, `@router.post`, etc.), extract the following information:
+
+1.  `http_method`: The HTTP method (e.g., GET, POST, PUT, DELETE).
+2.  `route_path`: The URL path for the endpoint (e.g., "/items/{{item_id}}").
+3.  `summary`: A brief summary or description of the endpoint, often found in the function's docstring or comments above it{yaml_desc_hint}.
+4.  `path_parameters`: A list of path parameters. For each, include:
+    *   `name`: Parameter name (e.g., "item_id").
+    *   `type`: Parameter type (e.g., "int", "str"){yaml_desc_hint}.
+5.  `query_parameters`: A list of query parameters. For each, include:
+    *   `name`: Parameter name (e.g., "limit").
+    *   `type`: Parameter type (e.g., "int", "str"){yaml_desc_hint}.
+    *   `default` (optional): Default value if specified.
+    *   `required` (optional): Boolean, true if the parameter is required, false or absent otherwise.
+6.  `request_body_model`: Information about the request body, if any. Include:
+    *   `model_name`: The Pydantic model name (e.g., "ItemCreate").
+    *   `fields`: A list of fields in the model, each with `name`, `type`{yaml_desc_hint}, and `required` (boolean).
+    *   `example` (optional): A simple JSON example of the request body{yaml_desc_hint}.
+7.  `response_model`: Information about the response. Include:
+    *   `model_name`: The Pydantic model name (e.g., "ItemRead").
+    *   `fields`: A list of fields in the model, each with `name` and `type`{yaml_desc_hint}.
+    *   `example` (optional): A simple JSON example of the response body{yaml_desc_hint}.
+    *   `status_code` (optional): The primary HTTP status code for successful responses (e.g., 200, 201).
+
+Format the output as a YAML list of dictionaries, with one dictionary per endpoint found in this file.
+If no FastAPI endpoints are found in this file, output an empty YAML list `[]`.
+
+Example for a single endpoint:
+```yaml
+- http_method: "POST"
+  route_path: "/items/"
+  summary: "Create a new item."{yaml_desc_hint}
+  path_parameters: []
+  query_parameters: []
+  request_body_model:
+    model_name: "ItemCreate"
+    fields:
+      - name: "name"
+        type: "str"
+        required: true
+      - name: "price"
+        type: "float"
+        required: true
+      - name: "description"
+        type: "Optional[str]"
+        required: false
+    example:
+      name: "My Item"
+      price: 10.5
+      description: "A cool item."
+  response_model:
+    model_name: "ItemRead"
+    fields:
+      - name: "id"
+        type: "int"
+      - name: "name"
+        type: "str"
+      - name: "price"
+        type: "float"
+      - name: "description"
+        type: "Optional[str]"
+    status_code: 201
+    example:
+      id: 1
+      name: "My Item"
+      price: 10.5
+      description: "A cool item."
+```
+
+Now, provide the YAML output for the file `{file_path}`:
+"""
+            try:
+                response = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0))
+                yaml_str = response.strip()
+                if "```yaml" in yaml_str:
+                    yaml_str = yaml_str.split("```yaml")[1].split("```")[0].strip()
+                elif "```" in yaml_str:
+                    yaml_str = yaml_str.split("```")[1].strip()
+
+                if not yaml_str:
+                    endpoints_in_file = []
+                else:
+                    endpoints_in_file = yaml.safe_load(yaml_str)
+
+                if not isinstance(endpoints_in_file, list):
+                    print(f"Warning: LLM output for {file_path} (FastAPI) was not a list, but: {type(endpoints_in_file)}. Treating as no endpoints found.")
+                    endpoints_in_file = []
+
+                if endpoints_in_file:
+                    all_endpoints_info.append({
+                        "file_path": file_path,
+                        "endpoints": endpoints_in_file
+                    })
+                    print(f"  - Found {len(endpoints_in_file)} FastAPI endpoint(s) in {file_path}")
+
+            except yaml.YAMLError as e:
+                print(f"Error parsing YAML from LLM response for {file_path} (FastAPI): {e}")
+                print(f"LLM Response was:\n{response}")
+            except Exception as e:
+                print(f"Error processing file {file_path} for FastAPI endpoints: {e}")
+                print(f"LLM Response was (if available):\n{response if 'response' in locals() else 'N/A'}")
+
+        if not all_endpoints_info:
+            print("No FastAPI endpoints identified in any Python files.")
+        else:
+            print(f"Identified FastAPI endpoints in {len(all_endpoints_info)} file(s).")
+        return all_endpoints_info
+
+    def post(self, shared, prep_res, exec_res):
+        shared["fastapi_endpoint_analysis"] = exec_res
+
+
+class GenerateAPIDocumentation(Node):
+    def prep(self, shared):
+        fastapi_analysis_data = shared.get("fastapi_endpoint_analysis", [])
+        project_name = shared["project_name"]
+        language = shared.get("language", "english")
+        use_cache = shared.get("use_cache", True)
+
+        if not fastapi_analysis_data:
+            print("No FastAPI endpoint analysis data found to generate API documentation.")
+            return None
+
+        return {
+            "fastapi_analysis_data": fastapi_analysis_data,
+            "project_name": project_name,
+            "language": language,
+            "use_cache": use_cache,
+        }
+
+    def exec(self, prep_res):
+        if prep_res is None:
+            return "" # Return empty string if no data
+
+        fastapi_analysis_data = prep_res["fastapi_analysis_data"]
+        project_name = prep_res["project_name"]
+        language = prep_res["language"]
+        use_cache = prep_res["use_cache"]
+
+        print(f"Generating API documentation for {project_name} using LLM...")
+
+        # Construct a string representation of the endpoint data for the prompt
+        endpoint_data_str_parts = []
+        for file_analysis in fastapi_analysis_data:
+            file_path = file_analysis.get("file_path", "Unknown file")
+            endpoint_data_str_parts.append(f"Endpoints from file: {file_path}\n")
+            if isinstance(file_analysis.get("endpoints"), list):
+                for endpoint in file_analysis["endpoints"]:
+                    endpoint_data_str_parts.append(f"- Method: {endpoint.get('http_method')}, Path: {endpoint.get('route_path')}")
+                    endpoint_data_str_parts.append(f"  Summary: {endpoint.get('summary', 'N/A')}")
+                    # Add more details as needed for the prompt, e.g., parameters, request/response bodies
+                    # This part can be expanded to make the YAML string more complete for the LLM context
+                    if endpoint.get("path_parameters"):
+                        endpoint_data_str_parts.append(f"  Path Params: {endpoint.get('path_parameters')}")
+                    if endpoint.get("query_parameters"):
+                        endpoint_data_str_parts.append(f"  Query Params: {endpoint.get('query_parameters')}")
+                    if endpoint.get("request_body_model"):
+                        endpoint_data_str_parts.append(f"  Request Body: {endpoint.get('request_body_model')}")
+                    if endpoint.get("response_model"):
+                        endpoint_data_str_parts.append(f"  Response Model: {endpoint.get('response_model')}")
+            endpoint_data_str_parts.append("\n")
+        full_endpoint_data_for_prompt = "\n".join(endpoint_data_str_parts)
+
+        language_instruction = ""
+        doc_lang_note = ""
+        if language.lower() != "english":
+            lang_cap = language.capitalize()
+            language_instruction = f"IMPORTANT: Generate the ENTIRE API documentation in **{lang_cap}**. Input data (summaries, types) might already be in {lang_cap}, but all surrounding text, explanations, and section titles MUST be in {lang_cap}. DO NOT use English except for technical keywords like HTTP methods, or Pydantic model names if they are intrinsically English.\n\n"
+            doc_lang_note = f" (Translate all descriptive text to {lang_cap})"
+
+        prompt = f"""
+{language_instruction}Project Name: {project_name}
+
+FastAPI Endpoint Data (extracted from source code):
+```yaml
+{full_endpoint_data_for_prompt}
+```
+
+Based on the structured FastAPI endpoint data provided above, generate a comprehensive API documentation in Markdown format, specifically for frontend developers{doc_lang_note}.
+
+The documentation should include:
+1.  A main title for the API documentation (e.g., "API Reference for {project_name}"){doc_lang_note}.
+2.  An introductory section briefly explaining what the API does or how to use the documentation{doc_lang_note}.
+3.  For each endpoint, create a section with:
+    *   A clear title including the HTTP method and route path (e.g., `POST /items/`){doc_lang_note}.
+    *   The summary/description of the endpoint{doc_lang_note}.
+    *   Path Parameters: If any, list them in a table with columns for `Name`, `Type`, and `Description`{doc_lang_note}.
+    *   Query Parameters: If any, list them in a table with columns for `Name`, `Type`, `Required`, `Default`, and `Description`{doc_lang_note}.
+    *   Request Body: If applicable, describe the expected request body. Include the Pydantic model name, its fields (with `Name`, `Type`, `Required`), and a JSON example{doc_lang_note}.
+    *   Response Model: Describe the expected response. Include the Pydantic model name, its fields (with `Name`, `Type`), the success status code, and a JSON example of the response{doc_lang_note}.
+
+Use clear Markdown formatting, including headings, tables, and code blocks for JSON examples.
+Ensure the language used is beginner-friendly for frontend developers and all descriptive text is in the target language specified ({language.capitalize() if language.lower() != 'english' else 'English'}).
+
+Output *only* the Markdown content for this API documentation.
+Do NOT include ```markdown``` tags around the output.
+
+Begin the documentation now:
+"""
+
+        try:
+            api_doc_markdown = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0))
+            print(f"Successfully generated API documentation for {project_name}.")
+            return api_doc_markdown.strip()
+        except Exception as e:
+            print(f"Error generating API documentation for {project_name}: {e}")
+            return "" # Return empty string on error
+
+    def post(self, shared, prep_res, exec_res):
+        shared["api_documentation_md"] = exec_res
+
+
 class WriteChapters(BatchNode):
     def prep(self, shared):
         chapter_order = shared["chapter_order"]  # List of indices
@@ -544,6 +939,7 @@ class WriteChapters(BatchNode):
         project_name = shared["project_name"]
         language = shared.get("language", "english")
         use_cache = shared.get("use_cache", True)  # Get use_cache flag, default to True
+        api_call_analysis = shared.get("api_call_analysis", []) # Get API call analysis
 
         # Get already written chapters to provide context
         # We store them temporarily during the batch run, not in shared memory yet
@@ -591,6 +987,15 @@ class WriteChapters(BatchNode):
                     files_data, related_file_indices
                 )
 
+                # Find relevant API calls for this abstraction's files
+                relevant_api_calls_for_abstraction = []
+                abstraction_file_paths = [files_data[idx][0] for idx in related_file_indices]
+
+                for analysis_item in api_call_analysis:
+                    if analysis_item["file_path"] in abstraction_file_paths:
+                        relevant_api_calls_for_abstraction.append(analysis_item)
+
+
                 # Get previous chapter info for transitions (uses potentially translated name)
                 prev_chapter = None
                 if i > 0:
@@ -616,6 +1021,7 @@ class WriteChapters(BatchNode):
                         "next_chapter": next_chapter,  # Add next chapter info (uses potentially translated name)
                         "language": language,  # Add language for multi-language support
                         "use_cache": use_cache, # Pass use_cache flag
+                        "api_calls_for_chapter": relevant_api_calls_for_abstraction, # Add relevant API calls
                         # previous_chapters_summary will be added dynamically in exec
                     }
                 )
@@ -639,6 +1045,8 @@ class WriteChapters(BatchNode):
         project_name = item.get("project_name")
         language = item.get("language", "english")
         use_cache = item.get("use_cache", True) # Read use_cache from item
+        api_calls_for_chapter = item.get("api_calls_for_chapter", []) # Get API calls for this chapter
+
         print(f"Writing chapter {chapter_num} for: {abstraction_name} using LLM...")
 
         # Prepare file context string from the map
@@ -661,9 +1069,10 @@ class WriteChapters(BatchNode):
         code_comment_note = ""
         link_lang_note = ""
         tone_note = ""
+        api_info_note = ""
         if language.lower() != "english":
             lang_cap = language.capitalize()
-            language_instruction = f"IMPORTANT: Write this ENTIRE tutorial chapter in **{lang_cap}**. Some input context (like concept name, description, chapter list, previous summary) might already be in {lang_cap}, but you MUST translate ALL other generated content including explanations, examples, technical terms, and potentially code comments into {lang_cap}. DO NOT use English anywhere except in code syntax, required proper nouns, or when specified. The entire output MUST be in {lang_cap}.\n\n"
+            language_instruction = f"IMPORTANT: Write this ENTIRE tutorial chapter in **{lang_cap}**. Some input context (like concept name, description, chapter list, previous summary, API call info) might already be in {lang_cap}, but you MUST translate ALL other generated content including explanations, examples, technical terms, and potentially code comments into {lang_cap}. DO NOT use English anywhere except in code syntax, required proper nouns, or when specified. The entire output MUST be in {lang_cap}.\n\n"
             concept_details_note = f" (Note: Provided in {lang_cap})"
             structure_note = f" (Note: Chapter names might be in {lang_cap})"
             prev_summary_note = f" (Note: This summary might be in {lang_cap})"
@@ -674,55 +1083,99 @@ class WriteChapters(BatchNode):
                 f" (Use the {lang_cap} chapter title from the structure above)"
             )
             tone_note = f" (appropriate for {lang_cap} readers)"
+            api_info_note = f" (Note: API call details might contain elements in {lang_cap})"
 
-        prompt = f"""
-{language_instruction}Write a very beginner-friendly tutorial chapter (in Markdown format) for the project `{project_name}` about the concept: "{abstraction_name}". This is Chapter {chapter_num}.
+        # Prepare API call information for the prompt
+        api_call_prompt_lines = []
+        if api_calls_for_chapter:
+            api_call_prompt_lines.append(f'''API Call Information for files related to "{abstraction_name}"{api_info_note}:''')
+            for api_info in api_calls_for_chapter:
+                api_call_prompt_lines.append(f"In file `{api_info['file_path']}`:")
+                if api_info['api_calls']:
+                    for call in api_info['api_calls']:
+                        calling_func = call.get('calling_function_name', 'N/A')
+                        endpoint = call.get('api_endpoint', 'N/A')
+                        method = call.get('http_method', 'N/A')
+                        req_params = call.get('request_parameters', 'N/A')
+                        resp_usage = call.get('response_usage', 'N/A')
+                        api_call_prompt_lines.append(f"- Function: `{calling_func}` calls API: `{endpoint}` (Method: {method})")
+                        api_call_prompt_lines.append(f"  Request Params: {req_params}")
+                        api_call_prompt_lines.append(f"  Response Usage: {resp_usage}")
+                else:
+                    api_call_prompt_lines.append("- No specific API calls found in the automated analysis for this file section, or the file was not a frontend file type.")
+            api_call_prompt_lines.append("\n")
+        api_call_prompt_section = "\n".join(api_call_prompt_lines)
 
-Concept Details{concept_details_note}:
-- Name: {abstraction_name}
+        prompt_template = f"""
+{language_instruction}Write a very beginner-friendly tutorial chapter (in Markdown format) for the project {{project_name}} about the concept: "{{abstraction_name}}". This is Chapter {{chapter_num}}.
+
+Concept Details{{concept_details_note}}:
+- Name: {{abstraction_name}}
 - Description:
-{abstraction_description}
+{{abstraction_description}}
 
-Complete Tutorial Structure{structure_note}:
-{item["full_chapter_listing"]}
+Complete Tutorial Structure{{structure_note}}:
+{{full_chapter_listing}}
 
-Context from previous chapters{prev_summary_note}:
-{previous_chapters_summary if previous_chapters_summary else "This is the first chapter."}
+Context from previous chapters{{prev_summary_note}}:
+{{previous_chapters_summary}}
 
 Relevant Code Snippets (Code itself remains unchanged):
-{file_context_str if file_context_str else "No specific code snippets provided for this abstraction."}
+{{file_context_str}}
 
+{{api_call_prompt_section}}
 Instructions for the chapter (Generate content in {language.capitalize()} unless specified otherwise):
-- Start with a clear heading (e.g., `# Chapter {chapter_num}: {abstraction_name}`). Use the provided concept name.
+- Start with a clear heading (e.g., `# Chapter {{chapter_num}}: {{abstraction_name}}`). Use the provided concept name.
 
-- If this is not the first chapter, begin with a brief transition from the previous chapter{instruction_lang_note}, referencing it with a proper Markdown link using its name{link_lang_note}.
+- If this is not the first chapter, begin with a brief transition from the previous chapter{{instruction_lang_note}}, referencing it with a proper Markdown link using its name{{link_lang_note}}.
 
-- Begin with a high-level motivation explaining what problem this abstraction solves{instruction_lang_note}. Start with a central use case as a concrete example. The whole chapter should guide the reader to understand how to solve this use case. Make it very minimal and friendly to beginners.
+- Begin with a high-level motivation explaining what problem this abstraction solves{{instruction_lang_note}}. Start with a central use case as a concrete example. The whole chapter should guide the reader to understand how to solve this use case. Make it very minimal and friendly to beginners.
 
-- If the abstraction is complex, break it down into key concepts. Explain each concept one-by-one in a very beginner-friendly way{instruction_lang_note}.
+- If the abstraction is complex, break it down into key concepts. Explain each concept one-by-one in a very beginner-friendly way{{instruction_lang_note}}.
 
-- Explain how to use this abstraction to solve the use case{instruction_lang_note}. Give example inputs and outputs for code snippets (if the output isn't values, describe at a high level what will happen{instruction_lang_note}).
+- Explain how to use this abstraction to solve the use case{{instruction_lang_note}}. Give example inputs and outputs for code snippets (if the output isn't values, describe at a high level what will happen{{instruction_lang_note}}).
 
-- Each code block should be BELOW 10 lines! If longer code blocks are needed, break them down into smaller pieces and walk through them one-by-one. Aggresively simplify the code to make it minimal. Use comments{code_comment_note} to skip non-important implementation details. Each code block should have a beginner friendly explanation right after it{instruction_lang_note}.
+- Each code block should be BELOW 10 lines! If longer code blocks are needed, break them down into smaller pieces and walk through them one-by-one. Aggresively simplify the code to make it minimal. Use comments{{code_comment_note}} to skip non-important implementation details. Each code block should have a beginner friendly explanation right after it{{instruction_lang_note}}.
 
-- Describe the internal implementation to help understand what's under the hood{instruction_lang_note}. First provide a non-code or code-light walkthrough on what happens step-by-step when the abstraction is called{instruction_lang_note}. It's recommended to use a simple sequenceDiagram with a dummy example - keep it minimal with at most 5 participants to ensure clarity. If participant name has space, use: `participant QP as Query Processing`. {mermaid_lang_note}.
+- Describe the internal implementation to help understand what's under the hood{{instruction_lang_note}}. First provide a non-code or code-light walkthrough on what happens step-by-step when the abstraction is called{{instruction_lang_note}}. It's recommended to use a simple sequenceDiagram with a dummy example - keep it minimal with at most 5 participants to ensure clarity. If participant name has space, use: `participant QP as Query Processing`. {{mermaid_lang_note}}.
 
-- Then dive deeper into code for the internal implementation with references to files. Provide example code blocks, but make them similarly simple and beginner-friendly. Explain{instruction_lang_note}.
+- Then dive deeper into code for the internal implementation with references to files. Provide example code blocks, but make them similarly simple and beginner-friendly. Explain{{instruction_lang_note}}.
 
-- IMPORTANT: When you need to refer to other core abstractions covered in other chapters, ALWAYS use proper Markdown links like this: [Chapter Title](filename.md). Use the Complete Tutorial Structure above to find the correct filename and the chapter title{link_lang_note}. Translate the surrounding text.
+- **If API call information is provided above, integrate it naturally into the explanations.** For example, when discussing a function or a piece of code that makes an API call, describe the endpoint, parameters, and how the response is used, based on the provided API call details. This should be part of the regular explanation, not a separate, disconnected section. {{instruction_lang_note}}
 
-- Use mermaid diagrams to illustrate complex concepts (```mermaid``` format). {mermaid_lang_note}.
+- IMPORTANT: When you need to refer to other core abstractions covered in other chapters, ALWAYS use proper Markdown links like this: [Chapter Title](filename.md). Use the Complete Tutorial Structure above to find the correct filename and the chapter title{{link_lang_note}}. Translate the surrounding text.
 
-- Heavily use analogies and examples throughout{instruction_lang_note} to help beginners understand.
+- Use mermaid diagrams to illustrate complex concepts (```mermaid``` format). {{mermaid_lang_note}}.
 
-- End the chapter with a brief conclusion that summarizes what was learned{instruction_lang_note} and provides a transition to the next chapter{instruction_lang_note}. If there is a next chapter, use a proper Markdown link: [Next Chapter Title](next_chapter_filename){link_lang_note}.
+- Heavily use analogies and examples throughout{{instruction_lang_note}} to help beginners understand.
 
-- Ensure the tone is welcoming and easy for a newcomer to understand{tone_note}.
+- End the chapter with a brief conclusion that summarizes what was learned{{instruction_lang_note}} and provides a transition to the next chapter{{instruction_lang_note}}. If there is a next chapter, use a proper Markdown link: [Next Chapter Title](next_chapter_filename){{link_lang_note}}.
+
+- Ensure the tone is welcoming and easy for a newcomer to understand{{tone_note}}.
 
 - Output *only* the Markdown content for this chapter.
 
 Now, directly provide a super beginner-friendly Markdown output (DON'T need ```markdown``` tags):
 """
+        prompt = prompt_template.format(
+            project_name=project_name,
+            abstraction_name=abstraction_name,
+            chapter_num=chapter_num,
+            concept_details_note=concept_details_note,
+            abstraction_description=abstraction_description,
+            structure_note=structure_note,
+            full_chapter_listing=item["full_chapter_listing"],
+            prev_summary_note=prev_summary_note,
+            previous_chapters_summary=previous_chapters_summary if previous_chapters_summary else "This is the first chapter.",
+            file_context_str=file_context_str if file_context_str else "No specific code snippets provided for this abstraction.",
+            api_call_prompt_section=api_call_prompt_section,
+            instruction_lang_note=instruction_lang_note,
+            link_lang_note=link_lang_note,
+            code_comment_note=code_comment_note,
+            mermaid_lang_note=mermaid_lang_note,
+            tone_note=tone_note
+        )
+
         chapter_content = call_llm(prompt, use_cache=(use_cache and self.cur_retry == 0)) # Use cache only if enabled and not retrying
         # Basic validation/cleanup
         actual_heading = f"# Chapter {chapter_num}: {abstraction_name}"  # Use potentially translated name
@@ -756,12 +1209,12 @@ class CombineTutorial(Node):
         output_base_dir = shared.get("output_dir", "output")  # Default output dir
         output_path = os.path.join(output_base_dir, project_name)
         repo_url = shared.get("repo_url")  # Get the repository URL
-        # language = shared.get("language", "english") # No longer needed for fixed strings
+        api_documentation_md = shared.get("api_documentation_md", "") # Get API documentation
 
         # Get potentially translated data
         relationships_data = shared[
             "relationships"
-        ]  # {"summary": str, "details": [{"from": int, "to": int, "label": str}]} -> summary/label potentially translated
+        ]  # {"summary": str, "details": [...]} -> summary/label potentially translated
         chapter_order = shared["chapter_order"]  # indices
         abstractions = shared[
             "abstractions"
@@ -772,109 +1225,103 @@ class CombineTutorial(Node):
 
         # --- Generate Mermaid Diagram ---
         mermaid_lines = ["flowchart TD"]
-        # Add nodes for each abstraction using potentially translated names
         for i, abstr in enumerate(abstractions):
             node_id = f"A{i}"
-            # Use potentially translated name, sanitize for Mermaid ID and label
             sanitized_name = abstr["name"].replace('"', "")
-            node_label = sanitized_name  # Using sanitized name only
+            node_label = sanitized_name
             mermaid_lines.append(
                 f'    {node_id}["{node_label}"]'
-            )  # Node label uses potentially translated name
-        # Add edges for relationships using potentially translated labels
+            )
         for rel in relationships_data["details"]:
             from_node_id = f"A{rel['from']}"
             to_node_id = f"A{rel['to']}"
-            # Use potentially translated label, sanitize
             edge_label = (
                 rel["label"].replace('"', "").replace("\n", " ")
-            )  # Basic sanitization
+            )
             max_label_len = 30
             if len(edge_label) > max_label_len:
                 edge_label = edge_label[: max_label_len - 3] + "..."
             mermaid_lines.append(
                 f'    {from_node_id} -- "{edge_label}" --> {to_node_id}'
-            )  # Edge label uses potentially translated label
-
+            )
         mermaid_diagram = "\n".join(mermaid_lines)
-        # --- End Mermaid ---
 
         # --- Prepare index.md content ---
         index_content = f"# Tutorial: {project_name}\n\n"
-        index_content += f"{relationships_data['summary']}\n\n"  # Use the potentially translated summary directly
-        # Keep fixed strings in English
+        index_content += f"{relationships_data['summary']}\n\n"
         index_content += f"**Source Repository:** [{repo_url}]({repo_url})\n\n"
 
-        # Add Mermaid diagram for relationships (diagram itself uses potentially translated names/labels)
+        # Add link to API Documentation if it exists
+        api_doc_filename = "api_reference.md"
+        if api_documentation_md and api_documentation_md.strip():
+            index_content += f"## API Reference\n\n"
+            index_content += f"See the [API Reference]({api_doc_filename}) for details on backend endpoints.\n\n"
+
+        index_content += "## Codebase Abstractions Diagram\n\n"
         index_content += "```mermaid\n"
         index_content += mermaid_diagram + "\n"
         index_content += "```\n\n"
-
-        # Keep fixed strings in English
         index_content += f"## Chapters\n\n"
 
         chapter_files = []
-        # Generate chapter links based on the determined order, using potentially translated names
         for i, abstraction_index in enumerate(chapter_order):
-            # Ensure index is valid and we have content for it
             if 0 <= abstraction_index < len(abstractions) and i < len(chapters_content):
-                abstraction_name = abstractions[abstraction_index][
-                    "name"
-                ]  # Potentially translated name
-                # Sanitize potentially translated name for filename
+                abstraction_name = abstractions[abstraction_index]["name"]
                 safe_name = "".join(
                     c if c.isalnum() else "_" for c in abstraction_name
                 ).lower()
                 filename = f"{i+1:02d}_{safe_name}.md"
-                index_content += f"{i+1}. [{abstraction_name}]({filename})\n"  # Use potentially translated name in link text
-
-                # Add attribution to chapter content (using English fixed string)
-                chapter_content = chapters_content[i]  # Potentially translated content
+                index_content += f"{i+1}. [{abstraction_name}]({filename})\n"
+                chapter_content = chapters_content[i]
                 if not chapter_content.endswith("\n\n"):
                     chapter_content += "\n\n"
-                # Keep fixed strings in English
                 chapter_content += f"---\n\nGenerated by [AI Codebase Knowledge Builder](https://github.com/The-Pocket/Tutorial-Codebase-Knowledge)"
-
-                # Store filename and corresponding content
                 chapter_files.append({"filename": filename, "content": chapter_content})
             else:
                 print(
                     f"Warning: Mismatch between chapter order, abstractions, or content at index {i} (abstraction index {abstraction_index}). Skipping file generation for this entry."
                 )
-
-        # Add attribution to index content (using English fixed string)
         index_content += f"\n\n---\n\nGenerated by [AI Codebase Knowledge Builder](https://github.com/The-Pocket/Tutorial-Codebase-Knowledge)"
 
         return {
             "output_path": output_path,
             "index_content": index_content,
-            "chapter_files": chapter_files,  # List of {"filename": str, "content": str}
+            "chapter_files": chapter_files,
+            "api_documentation_md": api_documentation_md, # Pass content for writing
+            "api_doc_filename": api_doc_filename if api_documentation_md and api_documentation_md.strip() else None
         }
 
     def exec(self, prep_res):
         output_path = prep_res["output_path"]
         index_content = prep_res["index_content"]
         chapter_files = prep_res["chapter_files"]
+        api_documentation_md = prep_res["api_documentation_md"]
+        api_doc_filename = prep_res["api_doc_filename"]
 
         print(f"Combining tutorial into directory: {output_path}")
-        # Rely on Node's built-in retry/fallback
         os.makedirs(output_path, exist_ok=True)
 
-        # Write index.md
         index_filepath = os.path.join(output_path, "index.md")
         with open(index_filepath, "w", encoding="utf-8") as f:
             f.write(index_content)
         print(f"  - Wrote {index_filepath}")
 
-        # Write chapter files
+        # Write API documentation file if content exists
+        if api_doc_filename and api_documentation_md:
+            api_doc_filepath = os.path.join(output_path, api_doc_filename)
+            with open(api_doc_filepath, "w", encoding="utf-8") as f:
+                f.write(api_documentation_md)
+            print(f"  - Wrote {api_doc_filepath}")
+
         for chapter_info in chapter_files:
             chapter_filepath = os.path.join(output_path, chapter_info["filename"])
             with open(chapter_filepath, "w", encoding="utf-8") as f:
                 f.write(chapter_info["content"])
             print(f"  - Wrote {chapter_filepath}")
 
-        return output_path  # Return the final path
+        return output_path
 
     def post(self, shared, prep_res, exec_res):
         shared["final_output_dir"] = exec_res  # Store the output path
         print(f"\nTutorial generation complete! Files are in: {exec_res}")
+
