@@ -1,4 +1,4 @@
-
+Gemini 모델 교체 : "GEMINI_MODEL", "gemini-2.5-pro-preview-05-06"
 - python3 -m venv venv
 - source venv/bin/activate
 - pip install -r requirements.txt
