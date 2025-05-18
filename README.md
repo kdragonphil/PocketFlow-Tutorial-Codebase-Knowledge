@@ -1,3 +1,13 @@
+
+- python3 -m venv venv
+- source venv/bin/activate
+- pip install -r requirements.txt
+### python main.py --repo https://github.com/adcream100/google_vision.git --language "korean" --include "*.py" "*.txt" "*.md" "*.json" "*.sh" --exclude "tests/*"
+
+### https://github.com/dabidstudio/code_to_tutorial
+
+### 참고 영상: https://youtu.be/cJpw-0QosVQ?si=EGCJKYOSCtoFqtDT
+
 <h1 align="center">Turns Codebase into Easy Tutorial with AI</h1>
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
